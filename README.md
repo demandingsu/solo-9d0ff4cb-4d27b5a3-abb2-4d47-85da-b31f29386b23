@@ -1,8 +1,11 @@
 # 机构知识库论文变更同步系统
 
 把机构知识库（源）中论文的**新增 / 修订 / 撤回**同步到检索库（采集端），
-保证撤回论文不再被检出。FastAPI + SQLite 实现，`docker compose` 一键启动，
-内置一个**无需账号的本地知识库源**，可演示修订、撤回、断线续采与游标过期。
+保证撤回论文不再被检出；同时随事件同步每篇论文的**整组参考文献**，
+按论文编号查询引用及被引论文的实时馆藏状态（可检索 / 已撤回 / 未收录）。
+FastAPI + SQLite 实现，`docker compose` 一键启动，
+内置一个**无需账号的本地知识库源**，可演示修订、撤回、断线续采、游标过期
+与引用整组替换、被引论文入库/撤回后状态自动翻转。
 
 ## 目录结构
 
@@ -15,14 +18,14 @@
 │   └── app/
 │       ├── data.py           # 不可改写的变更事件种子数据（含乱序、重复、旧版重投）
 │       └── main.py           # /changes 变更流、/control/* 演示控制、/events
-├── collector/                # 采集端：采集 API、暂存、原子发布、可查询论文库
+├── collector/                # 采集端：采集 API、暂存、原子发布、可查询论文库与引用图
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
-│       ├── db.py             # SQLite 表结构、暂存去重、撤回粘性、原子发布
+│       ├── db.py             # SQLite 表结构、暂存去重、撤回粘性、引用整组替换、原子发布
 │       ├── sync.py           # 分页拉取、每页检查点、410 重取原区间、后台 worker
 │       ├── schemas.py
-│       └── main.py           # 采集 / 续采 / 查询 HTTP API
+│       └── main.py           # 采集 / 续采 / 论文 / 引用查询 HTTP API
 ├── tests/                    # pytest（httpx MockTransport，无需起服务）
 ├── demo/demo.sh              # 端到端演示脚本
 └── requirements-dev.txt      # 本地测试依赖
@@ -51,6 +54,12 @@ docker compose up -d --build
 | 整区间取齐才一起更新论文库与完成时间 | 全部页 `done` 后，在**单事务**内把暂存发布到 `papers` 并写 `sync_state.completed_at`；任一步失败整体回滚 |
 | 失败时旧库可查、暂存不可见 | 暂存表 `staged_changes` 与查询表 `papers` 物理隔离；查询 API 只读 `papers`，未发布的暂存对外完全不可见 |
 | 撤回论文不被检出 | `GET /papers` 默认隐藏 `is_retracted=1`；`GET /papers/{id}` 对撤回论文返回 **HTTP 410 Gone**（加 `?include_retracted=true` 可审计查看） |
+| 事件携带被引论文编号数组，旧事件缺省为空 | 源事件新增可选字段 `references: list[str]`，缺失时由响应模型与采集端统一按 `[]` 处理；种子数据保留不带该字段的旧事件 |
+| 每篇论文只保留最高修订的**整组**引用，新修订替换旧组 | 暂存 `staged_references` 与正式 `paper_references` 均以 `(paper_id, cited_paper_id)` 为主键；事件修订号不高于已暂存修订时不动引用组，更高/同修订重投时 **DELETE 后整组重写**，低修订重投无法抹掉新组 |
+| 跨页重投不产生重复引用 | 主键唯一约束 + 写入前去重（`normalize_references` 折叠同组内重复编号），同事件跨页、跨区间重投都是幂等的 |
+| 按论文编号查引用并区分可检索/已撤回/未收录 | `GET /papers/{id}/references` 返回每条引用的 `status`：`indexed`（在馆且未撤回）、`retracted`（在馆但已撤回）、`not_indexed`（从未入馆）；引用方自身撤回时默认 410，加 `?include_retracted=true` 可审计 |
+| 被引论文后来入库/撤回，查询随馆藏变化，引用方无须重采 | 引用表只存编号关系，**不落状态快照**；查询时 `LEFT JOIN papers` 实时计算状态，被引论文下一次发布后状态立即翻转，引用方没有新事件也不影响 |
+| 引用关系与馆藏、完成时间一起发布；取页失败/游标过期/续采期间仍是上一版完整结果 | 引用组的换发与 `papers` UPSERT、`sync_state.completed_at` 写在**同一个发布事务**；暂存引用对外不可见，任务失败或 410 重取期间查询只读已发布的上一版整组结果 |
 
 > `completed_at` 记录的是本次**区间结束时间**（下次拉取的变更时间基线），
 > 而不是墙上时钟，否则回填历史区间时增量起点会晚于历史 `end` 而无法重取。
@@ -66,6 +75,7 @@ docker compose up -d --build
 | `GET /sync/state` | 上次同步的源、区间与完成时间 |
 | `GET /papers` | 论文列表，默认隐藏撤回；`?include_retracted=true` 可包含 |
 | `GET /papers/{id}` | 按编号查询；撤回论文返回 410 |
+| `GET /papers/{id}/references` | 该论文整组引用 + 每条被引论文的实时状态（`indexed` / `retracted` / `not_indexed`）；引用方撤回时默认 410，加 `?include_retracted=true` 可审计 |
 | `GET /papers-count` | 计数 |
 
 任务状态机：`collecting → committing → completed`；异常进入 `failed`，
@@ -106,6 +116,12 @@ curl -X POST localhost:8001/sync/jobs/2/resume
 curl -X POST localhost:8000/control/expire-after -H 'Content-Type: application/json' -d '{"requests":1}'
 curl -X POST localhost:8001/sync/jobs -H 'Content-Type: application/json' \
   -d '{"end":"2026-11-11T23:59:59Z"}'       # cursor_resets=1，再 resume
+
+# 4) 引用查询：三态区分；被引论文后续入库/撤回会自动翻转，引用方无需重采
+curl localhost:8001/papers/P0006/references
+#   P0098/P0099 -> not_indexed（未收录）
+curl 'localhost:8001/papers/P0001/references?include_retracted=true'
+#   P0002 -> indexed（可检索），P0003 -> retracted（已撤回）
 ```
 
 ## 本地测试（不依赖 Docker）
@@ -116,11 +132,30 @@ PYTHONPATH=. python -m pytest -q
 ```
 
 覆盖：分页乱序/重复去重、最高修订胜出、撤回粘性与 410、失败时旧库可查且暂存
-不可见、续采、游标过期重取原区间、重启后 interrupted 翻转、源端非重入锁回归等。
+不可见、续采、游标过期重取原区间、重启后 interrupted 翻转、源端非重入锁回归，
+以及引用专项：旧事件空引用、整组最高修订替换与组内/跨页去重、三态区分、
+被引论文入库/撤回后查询实时翻转（引用方不重采）、失败/续采/游标过期期间
+上一版引用结果持续可查。
+
+## 引用关系数据模型
+
+- `staged_references(job_id, paper_id, cited_paper_id)`：任务级暂存引用图，
+  与 `staged_changes` 同生命周期，游标过期清空暂存时一并删除。
+- `paper_references(paper_id, cited_paper_id)`：已发布引用图，只存编号关系，
+  不存被引状态；状态在查询时通过 `LEFT JOIN papers` 实时推导：
+
+| 关联结果 | 状态 |
+| --- | --- |
+| 命中 `papers` 且 `is_retracted=0` | `indexed`（可检索） |
+| 命中 `papers` 且 `is_retracted=1` | `retracted`（已撤回） |
+| 未命中 | `not_indexed`（未收录） |
+
+旧版本采集端的数据库卷首次启动时会自动补齐这两张表（附加式迁移，
+已有 `papers` 数据不受影响）。
 
 ## 数据安全与隔离说明
 
 - 采集端 SQLite（WAL 模式）放在命名卷 `collector_data`，容器重启不丢检查点。
 - 源端事件为 append-only 不可改写；采集端不修改源数据，只做拉取与本地发布。
-- 所有"对外可见"的只有 `papers` 表；`staged_changes`、`jobs`、`sync_state`
-  仅服务于同步过程与运维观测。
+- 所有"对外可见"的只有 `papers` 与 `paper_references` 表；`staged_changes`、
+  `staged_references`、`jobs`、`sync_state` 仅服务于同步过程与运维观测。

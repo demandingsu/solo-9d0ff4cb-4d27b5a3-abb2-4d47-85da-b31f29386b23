@@ -9,6 +9,13 @@ Design points:
   transaction publishes them together with the new completed time.
 * Retraction is sticky in the committed ``papers`` table: once a paper is
   retracted, an older non-retracted revision can never undo it.
+* Each paper keeps one whole citation set: the staged set is replaced only by
+  a strictly higher revision, so stale redeliveries (including cross-page
+  duplicates) can never erase or duplicate citations. Publication replaces
+  the committed set atomically together with the paper row and completion
+  time, and every citation status is derived live from the committed
+  ``papers`` table — cited papers entering or leaving the library change the
+  query result without the citing paper being re-fetched.
 """
 from __future__ import annotations
 
@@ -57,6 +64,16 @@ CREATE TABLE IF NOT EXISTS staged_changes (
     PRIMARY KEY (job_id, paper_id)
 );
 
+-- One row per (job, citing paper, cited paper). The set is rebuilt wholesale
+-- whenever a strictly higher revision of the citing paper is staged, so the
+-- table always represents the highest-revision whole citation set.
+CREATE TABLE IF NOT EXISTS staged_references (
+    job_id        INTEGER NOT NULL REFERENCES jobs(id),
+    paper_id      TEXT NOT NULL,
+    cited_paper_id TEXT NOT NULL,
+    PRIMARY KEY (job_id, paper_id, cited_paper_id)
+);
+
 CREATE TABLE IF NOT EXISTS papers (
     paper_id      TEXT PRIMARY KEY,
     rev           INTEGER NOT NULL,
@@ -65,6 +82,15 @@ CREATE TABLE IF NOT EXISTS papers (
     is_retracted  INTEGER NOT NULL,
     changed_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
+);
+
+-- Committed citation graph. Replaced atomically per citing paper during
+-- publication; the UNIQUE primary key guarantees no duplicate citation even
+-- when the same event is redelivered across pages or sync windows.
+CREATE TABLE IF NOT EXISTS paper_references (
+    paper_id       TEXT NOT NULL,
+    cited_paper_id TEXT NOT NULL,
+    PRIMARY KEY (paper_id, cited_paper_id)
 );
 """
 
@@ -90,6 +116,7 @@ def init_db(db_path: str | None = None) -> None:
         conn = connect(db_path)
         try:
             conn.executescript(SCHEMA)
+            _migrate(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO sync_state (id, source_url, completed_at) "
                 "VALUES (1, '', NULL)"
@@ -105,6 +132,25 @@ def init_db(db_path: str | None = None) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive migrations for databases created by older collector versions.
+
+    CREATE TABLE IF NOT EXISTS already covers fresh installs; this only needs
+    to guarantee the citation tables exist for a pre-feature volume.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS staged_references ("
+        "job_id INTEGER NOT NULL REFERENCES jobs(id), "
+        "paper_id TEXT NOT NULL, cited_paper_id TEXT NOT NULL, "
+        "PRIMARY KEY (job_id, paper_id, cited_paper_id))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS paper_references ("
+        "paper_id TEXT NOT NULL, cited_paper_id TEXT NOT NULL, "
+        "PRIMARY KEY (paper_id, cited_paper_id))"
+    )
 
 
 @contextmanager
@@ -241,7 +287,58 @@ def list_staged(conn: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:
 
 
 def clear_staged(conn: sqlite3.Connection, job_id: int) -> None:
+    """Discard every staged row of a job (used on cursor-expiry re-fetch)."""
+    conn.execute("DELETE FROM staged_references WHERE job_id=?", (job_id,))
     conn.execute("DELETE FROM staged_changes WHERE job_id=?", (job_id,))
+
+
+def normalize_references(raw) -> list[str]:
+    """Defensive normalization of a source references payload.
+
+    Missing/None -> []; non-list payloads are coerced to an empty list rather
+    than crashing the sync. Duplicate ids collapse (first occurrence wins, so
+    the order advertised by the source is preserved); blank ids are dropped.
+    """
+    if not raw:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in raw:
+        cited = str(item).strip()
+        if not cited or cited in seen:
+            continue
+        seen.add(cited)
+        result.append(cited)
+    return result
+
+
+def replace_staged_references(conn: sqlite3.Connection, job_id: int,
+                              paper_id: str, references: list[str]) -> None:
+    """Wholesale-replace one paper's staged citation set (whole-group rule).
+
+    The UNIQUE primary key makes repeated redelivery idempotent; DELETE+INSERT
+    implements 'a new revision replaces the old group'.
+    """
+    conn.execute(
+        "DELETE FROM staged_references WHERE job_id=? AND paper_id=?",
+        (job_id, paper_id),
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO staged_references (job_id, paper_id, cited_paper_id) "
+        "VALUES (?, ?, ?)",
+        [(job_id, paper_id, cited) for cited in references],
+    )
+
+
+def list_staged_references(conn: sqlite3.Connection, job_id: int,
+                           paper_id: str) -> list[str]:
+    return [r["cited_paper_id"] for r in conn.execute(
+        "SELECT cited_paper_id FROM staged_references "
+        "WHERE job_id=? AND paper_id=? ORDER BY cited_paper_id",
+        (job_id, paper_id),
+    )]
 
 
 # --------------------------------------------------------------------------- #
@@ -306,3 +403,67 @@ def count_papers(conn: sqlite3.Connection, include_retracted: bool) -> int:
     if not include_retracted:
         sql += " WHERE is_retracted=0"
     return int(conn.execute(sql).fetchone()["c"])
+
+
+# --------------------------------------------------------------------------- #
+# committed citation graph
+# --------------------------------------------------------------------------- #
+def replace_paper_references(conn: sqlite3.Connection, paper_id: str,
+                             cited_paper_ids: list[str]) -> None:
+    """Publish one paper's whole citation set atomically with its paper row.
+
+    DELETE + INSERT swaps the whole group, so a new revision fully replaces
+    the old set; the PRIMARY KEY (paper_id, cited_paper_id) guarantees that a
+    redelivered event can never create duplicate citations.
+    """
+    conn.execute(
+        "DELETE FROM paper_references WHERE paper_id=?", (paper_id,)
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO paper_references (paper_id, cited_paper_id) "
+        "VALUES (?, ?)",
+        [(paper_id, cited) for cited in cited_paper_ids],
+    )
+
+
+def list_paper_references(conn: sqlite3.Connection, paper_id: str) -> list[sqlite3.Row]:
+    """Citations of one paper with the cited paper's CURRENT library status.
+
+    Status is derived live from the committed ``papers`` table on every call:
+
+    * ``indexed``      – cited paper is in the library and not retracted
+                         (retrievable);
+    * ``retracted``    – cited paper is in the library but retracted;
+    * ``not_indexed``  – cited paper has never been published into the library.
+
+    Because no status is snapshotted, a cited paper that is later ingested or
+    retracted flips the result here immediately; the citing paper itself never
+    needs to be re-collected.
+    """
+    return list(conn.execute(
+        """
+        SELECT r.cited_paper_id AS cited_paper_id,
+               p.paper_id        AS resolved_paper_id,
+               CASE
+                 WHEN p.paper_id IS NULL              THEN 'not_indexed'
+                 WHEN COALESCE(p.is_retracted, 0)=1  THEN 'retracted'
+                 ELSE 'indexed'
+               END AS status,
+               COALESCE(p.rev, 0)          AS cited_rev,
+               p.title                     AS cited_title,
+               p.is_retracted              AS cited_is_retracted
+        FROM paper_references r
+        LEFT JOIN papers p ON p.paper_id = r.cited_paper_id
+        WHERE r.paper_id = ?
+        ORDER BY r.cited_paper_id
+        """,
+        (paper_id,),
+    ))
+
+
+def count_paper_references(conn: sqlite3.Connection, paper_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM paper_references WHERE paper_id=?",
+        (paper_id,),
+    ).fetchone()
+    return int(row["c"])

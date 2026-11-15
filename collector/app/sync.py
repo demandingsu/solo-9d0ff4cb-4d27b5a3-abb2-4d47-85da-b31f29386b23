@@ -97,10 +97,26 @@ def run_sync(job_id: int, db_path: str | None = None) -> None:
                     return
 
                 # Durable checkpoint: page rows and continuation cursor commit
-                # together, so resume never loses or skips a page.
+                # together, so resume never loses or skips a page. Citation
+                # sets follow the same highest-revision rule as the paper row:
+                # only a STRICTLY higher revision wholesale-replaces the group,
+                # so stale (and equal-revision redelivered) events can never
+                # erase citations, while duplicate redelivery stays idempotent.
                 with db.transaction(conn) as tx:
                     for event in page["changes"]:
+                        staged = tx.execute(
+                            "SELECT rev FROM staged_changes "
+                            "WHERE job_id=? AND paper_id=?",
+                            (job_id, event["paper_id"]),
+                        ).fetchone()
                         db.upsert_staged(tx, job_id, event)
+                        if staged is None or event["rev"] > staged["rev"]:
+                            references = db.normalize_references(
+                                event.get("references", [])
+                            )
+                            db.replace_staged_references(
+                                tx, job_id, event["paper_id"], references
+                            )
                     cursor = page["next_cursor"]
                     pages += 1
                     fetch_done = bool(page["done"])
@@ -111,12 +127,28 @@ def run_sync(job_id: int, db_path: str | None = None) -> None:
 
         # Whole interval collected: publish staging and completed time in one
         # atomic transaction. Any error rolls back; old library stays queryable
-        # and staging remains private until a successful resume.
+        # and staging remains private until a successful resume. The citation
+        # graph is swapped inside the same transaction, so papers, references
+        # and completed_at always become visible together.
         with db.transaction(conn) as tx:
             db.mark_status(tx, job_id, "committing")
             published_at = db.utc_now_iso()
             for row in db.list_staged(tx, job_id):
+                # Snapshot the committed revision BEFORE upsert_paper so the
+                # citation group is guarded by the same rule as the paper row:
+                # a stale redelivery in this interval must never swap out the
+                # previously published group (e.g. with an empty legacy set).
+                committed = tx.execute(
+                    "SELECT rev FROM papers WHERE paper_id=?",
+                    (row["paper_id"],),
+                ).fetchone()
                 db.upsert_paper(tx, row)
+                if committed is None or row["rev"] > committed["rev"]:
+                    db.replace_paper_references(
+                        tx,
+                        row["paper_id"],
+                        db.list_staged_references(tx, job_id, row["paper_id"]),
+                    )
             # completed_at is the change-time baseline for the next incremental
             # fetch, so it must equal this interval's closed end (not wall-clock
             # time); otherwise a historical cutoff would never be re-fetchable.

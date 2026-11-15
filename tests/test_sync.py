@@ -17,6 +17,16 @@ _TMP = tempfile.TemporaryDirectory()
 os.environ["COLLECTOR_DB"] = os.path.join(_TMP.name, "test.db")
 os.environ["SOURCE_URL"] = "http://fake-source"
 
+# Monotonic counter so every test's DB path is unique even after a FakeSource
+# object is garbage-collected and its id() gets reused.
+_DB_SEQ = 0
+
+
+def _next_db_path(prefix: str) -> str:
+    global _DB_SEQ
+    _DB_SEQ += 1
+    return os.path.join(_TMP.name, f"{prefix}_{_DB_SEQ}.db")
+
 from fastapi.testclient import TestClient  # noqa: E402
 
 from collector.app import db, sync  # noqa: E402
@@ -37,14 +47,20 @@ class FakeSource:
         self.calls = 0
         self._lock = threading.Lock()
 
-    def add(self, paper_id, rev, retracted, changed_at, title=None, authors=None):
-        self.events.append({
+    def add(self, paper_id, rev, retracted, changed_at, title=None, authors=None,
+            references=None):
+        row = {
             "paper_id": paper_id, "rev": rev,
             "title": title or f"title-{paper_id}-{rev}",
             "authors": authors or "author",
             "is_retracted": 1 if retracted else 0,
             "changed_at": changed_at,
-        })
+        }
+        # Explicitly omit the field when the caller does not pass it, so the
+        # collector's legacy-event default (empty list) is exercised too.
+        if references is not None:
+            row["references"] = references
+        self.events.append(row)
 
     def _cursor(self, start, end, offset):
         return f"{self.generation}.{json.dumps([start, end, offset])}"
@@ -106,8 +122,8 @@ def client(source, monkeypatch):
         return real_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "Client", patched_client)
-    # Fresh DB per test.
-    db_path = os.path.join(_TMP.name, f"test_{id(source)}.db")
+    # Fresh DB per test (unique path: id() can be reused after GC).
+    db_path = _next_db_path("test")
     monkeypatch.setattr("collector.app.main.DB_PATH", db_path)
 
     # Do not spawn API-level background threads; tests drive the real worker

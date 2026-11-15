@@ -128,6 +128,36 @@ def test_injected_failure_then_recovery(client):
     assert STATE.fail_next == 0
 
 
+def test_references_field_defaults_to_empty_and_passes_through(client):
+    client.post("/control/reset")
+    r = client.get("/events")
+    changes = r.json()["events"]
+    by_paper = {(c["paper_id"], c["rev"]): c for c in changes}
+
+    # Legacy seed event without the field (P0002 rev 1): the raw event store
+    # simply omits the key; consumers must default it to an empty list.
+    assert by_paper[("P0002", 1)].get("references", []) == []
+    # Event carrying references is passed through verbatim (incl. duplicates,
+    # which the collector is responsible for collapsing).
+    assert by_paper[("P0001", 2)]["references"] == ["P0002", "P0002", "P0003"]
+    # Explicit empty list stays an empty list.
+    assert by_paper[("P0005", 1)]["references"] == []
+
+    # The /changes feed goes through the response model, so there the field is
+    # always present — including for legacy events that omit it in storage.
+    params = {"start": "1970-01-01T00:00:00Z", "end": "2026-12-31T23:59:59Z"}
+    feed = []
+    cursor = None
+    while True:
+        page = client.get("/changes", params={**params, **({"cursor": cursor} if cursor else {})}).json()
+        feed.extend(page["changes"])
+        if page["done"]:
+            break
+        cursor = page["next_cursor"]
+    legacy = next(c for c in feed if (c["paper_id"], c["rev"]) == ("P0002", 1))
+    assert legacy["references"] == []
+
+
 def test_expire_after_hook_invalidates_next_cursor(client):
     client.post("/control/reset")
     # Wide window covers all seed events (multiple pages), so the first call

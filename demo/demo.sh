@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end demo: full sync, disconnect/resume, cursor expiry, incremental
-# sync, retraction stickiness, and collector restart resumption.
+# sync, retraction stickiness, collector restart resumption, and the citation
+# graph (whole-group replacement, dedupe, indexed/retracted/not_indexed
+# statuses and live flips when a cited paper is ingested later).
 #
 # Usage:
 #   docker compose up -d --build
@@ -205,7 +207,46 @@ for _ in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-hr "5. Final library state"
+hr "5. Citation graph: whole-group replacement, dedupe and live status"
+# ---------------------------------------------------------------------------
+say "P0001 is retracted: its citations return 410 by default, auditable with the flag"
+curl -s -o /dev/null -w "  GET /papers/P0001/references -> HTTP %{http_code} (410 expected)\n" \
+  "$COLLECTOR/papers/P0001/references"
+req "$COLLECTOR/papers/P0001/references?include_retracted=true" \
+  | jq -r '.references[] | "  P0001 -> \(.cited_paper_id): \(.status)"'
+
+say "Three statuses at once: P0006 cites unindexed papers (not_indexed)"
+req "$COLLECTOR/papers/P0006/references" \
+  | jq -r '.references[] | "  P0006 -> \(.cited_paper_id): \(.status)"'
+
+say "Highest revision keeps the WHOLE group: P0005 rev3 replaced its rev2 citations"
+req "$COLLECTOR/papers/P0005/references" \
+  | jq -r '"  rev=\(.rev):", (.references[] | "    -> \(.cited_paper_id): \(.status)")'
+
+say "P0007 cites P0008 which is not in the library yet"
+req "$COLLECTOR/papers/P0007/references" \
+  | jq -r '.references[] | "  P0007 -> \(.cited_paper_id): \(.status)"'
+
+say "Ingest P0008 in a new sync window; P0007 itself is never re-sent"
+req -X POST "$SOURCE/control/append" -H 'Content-Type: application/json' \
+  -d '{"events":[{"paper_id":"P0008","rev":1,"title":"Metadata Crosswalks for ETD Repositories",
+                  "authors":"R. Diaz","is_retracted":0,"references":[],
+                  "changed_at":"2026-11-13T09:00:00Z"}]}' >/dev/null
+JOB5=$(req -X POST "$COLLECTOR/sync/jobs" -H 'Content-Type: application/json' \
+        -d '{"end":"2026-11-13T23:59:59Z"}')
+JOB5_ID=$(echo "$JOB5" | jq -r .id)
+for _ in $(seq 1 30); do
+  ST=$(req "$COLLECTOR/sync/jobs/$JOB5_ID" | jq -r .status)
+  [ "$ST" = "completed" ] && break
+  [ "$ST" = "failed" ] && { req "$COLLECTOR/sync/jobs/$JOB5_ID" | jq .; exit 1; }
+  sleep 1
+done
+say "Same P0007 query now shows P0008 as indexed (live flip, no re-collection)"
+req "$COLLECTOR/papers/P0007/references" \
+  | jq -r '.references[] | "  P0007 -> \(.cited_paper_id): \(.status)"'
+
+# ---------------------------------------------------------------------------
+hr "6. Final library state"
 # ---------------------------------------------------------------------------
 req "$COLLECTOR/sync/state" | jq .
 say "Visible (non-retracted) papers:"

@@ -112,6 +112,11 @@ class ChangeEvent(BaseModel):
     title: str
     authors: str
     is_retracted: int = Field(ge=0, le=1)
+    # Whole cited-paper id set as of this revision. Legacy events predate the
+    # field, so it is optional and defaults to an empty list. A new revision
+    # replaces the entire set; duplicate ids / cross-page redelivery must be
+    # deduplicated by the collector.
+    references: list[str] = Field(default_factory=list)
     changed_at: str
 
 

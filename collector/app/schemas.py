@@ -46,3 +46,28 @@ class PaperResponse(BaseModel):
     is_retracted: int
     changed_at: str
     updated_at: str
+
+
+class CitationItem(BaseModel):
+    cited_paper_id: str = Field(..., description="id of the cited paper")
+    status: str = Field(
+        ...,
+        description="indexed = retrievable in the library; "
+        "retracted = in the library but retracted; "
+        "not_indexed = never published into the library",
+    )
+    is_retracted: int | None = Field(
+        None, description="1 when the cited paper is committed and retracted, else null"
+    )
+    rev: int | None = Field(
+        None, description="committed revision of the cited paper, null when not indexed"
+    )
+    title: str | None = Field(None, description="committed title, null when not indexed")
+
+
+class PaperReferencesResponse(BaseModel):
+    paper_id: str
+    rev: int = Field(..., description="committed revision carrying this citation set")
+    is_retracted: int
+    reference_count: int
+    references: list[CitationItem]

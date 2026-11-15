@@ -2,13 +2,15 @@
 
 Endpoints
 ---------
-POST   /sync/jobs              create a sync job (full or incremental)
-GET    /sync/jobs              list jobs
-GET    /sync/jobs/{id}         job status incl. durable checkpoint details
-POST   /sync/jobs/{id}/resume  resume a failed/interrupted job
-GET    /sync/state             last completed interval and completion time
-GET    /papers                 query library (retracted hidden by default)
-GET    /papers/{paper_id}      lookup one paper (410 when retracted)
+POST   /sync/jobs                       create a sync job (full or incremental)
+GET    /sync/jobs                       list jobs
+GET    /sync/jobs/{id}                  job status incl. durable checkpoint details
+POST   /sync/jobs/{id}/resume           resume a failed/interrupted job
+GET    /sync/state                      last completed interval and completion time
+GET    /papers                          query library (retracted hidden by default)
+GET    /papers/{paper_id}               lookup one paper (410 when retracted)
+GET    /papers/{paper_id}/references    citations + live cited-paper status
+GET    /papers-count                    paper count
 """
 from __future__ import annotations
 
@@ -19,7 +21,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 
 from . import db, sync
-from .schemas import CreateJobRequest, JobResponse, PaperResponse, StateResponse
+from .schemas import (
+    CitationItem,
+    CreateJobRequest,
+    JobResponse,
+    PaperReferencesResponse,
+    PaperResponse,
+    StateResponse,
+)
 
 DB_PATH = os.getenv("COLLECTOR_DB", "/data/collector.db")
 DEFAULT_SOURCE_URL = os.getenv("SOURCE_URL", "http://source:8000")
@@ -203,6 +212,63 @@ def get_paper(
                        "use ?include_retracted=true to inspect it",
             )
         return PaperResponse(**dict(row))
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/papers/{paper_id}/references",
+    response_model=PaperReferencesResponse,
+    summary="Citations of a paper and the current library status of each cited paper",
+)
+def get_paper_references(
+    paper_id: str, include_retracted: bool = Query(
+        False,
+        description="when the citing paper is retracted, return 410 unless this is true",
+    )
+) -> PaperReferencesResponse:
+    """Return the whole committed citation set of one paper.
+
+    Each cited paper's ``status`` is computed at query time from the committed
+    ``papers`` table — ``indexed`` (retrievable), ``retracted`` or
+    ``not_indexed``. When a cited paper is later ingested or retracted, this
+    response changes with the published library on its own; the citing paper
+    does not have to be re-collected. Only published data is read, so while a
+    sync is fetching, has failed or is re-fetching after cursor expiry, the
+    previous complete result keeps being served.
+    """
+    conn = _conn()
+    try:
+        paper = db.get_paper(conn, paper_id)
+        if paper is None:
+            raise HTTPException(status_code=404, detail="paper not found")
+        if paper["is_retracted"] and not include_retracted:
+            raise HTTPException(
+                status_code=410,
+                detail="citing paper has been retracted and is hidden; "
+                       "use ?include_retracted=true to inspect its citations",
+            )
+        rows = db.list_paper_references(conn, paper_id)
+        items = [
+            CitationItem(
+                cited_paper_id=r["cited_paper_id"],
+                status=r["status"],
+                is_retracted=(
+                    None if r["resolved_paper_id"] is None
+                    else int(r["cited_is_retracted"])
+                ),
+                rev=None if r["resolved_paper_id"] is None else int(r["cited_rev"]),
+                title=r["cited_title"],
+            )
+            for r in rows
+        ]
+        return PaperReferencesResponse(
+            paper_id=paper_id,
+            rev=paper["rev"],
+            is_retracted=paper["is_retracted"],
+            reference_count=len(items),
+            references=items,
+        )
     finally:
         conn.close()
 
